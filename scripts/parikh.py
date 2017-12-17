@@ -1,230 +1,91 @@
-import numpy
+from keras.layers import *
+from keras.activations import softmax
+from keras.models import Model
 
-from keras.layers import InputSpec, Layer, Input, Dense, merge
-from keras.layers import Lambda, Activation, Dropout, Embedding, TimeDistributed
-from keras.layers import Bidirectional, GRU, LSTM
-from keras.layers.noise import GaussianNoise
-from keras.layers.advanced_activations import ELU
-import keras.backend as K
-from keras.models import Sequential, Model, model_from_json
-from keras.regularizers import l2
-from keras.optimizers import Adam
-from keras.layers.normalization import BatchNormalization
-from keras.layers.pooling import GlobalAveragePooling1D, GlobalMaxPooling1D
-from keras.layers import Merge
+def StaticEmbedding(embedding_matrix, trainable=False):
+    in_dim, out_dim = embedding_matrix.shape
+    embedding = Embedding(in_dim, out_dim, weights=[embedding_matrix], trainable=trainable)
+    return embedding
 
+def unchanged_shape(input_shape):
+    return input_shape
 
-def build_model(vectors, shape, settings):
-    '''Compile the model.'''
-    max_length, nr_hidden, nr_class = shape
-    # Declare inputs.
-    ids1 = Input(shape=(max_length,), dtype='int32', name='words1')
-    ids2 = Input(shape=(max_length,), dtype='int32', name='words2')
+def time_distributed(x, layers):
+    for l in layers:
+        x = TimeDistributed(l)(x)
+    return x
 
-    # Construct operations, which we'll chain together.
-    embed = _StaticEmbedding(vectors, max_length, nr_hidden, dropout=0.2, nr_tune=5000)
-    if settings['gru_encode']:
-        encode = _BiRNNEncoding(max_length, nr_hidden, dropout=settings['dropout'])
-    attend = _Attention(max_length, nr_hidden, dropout=settings['dropout'])
-    align = _SoftAlignment(max_length, nr_hidden)
-    compare = _Comparison(max_length, nr_hidden, dropout=settings['dropout'])
-    entail = _Entailment(nr_hidden, nr_class, dropout=settings['dropout'])
+def align(input_1, input_2):
+    attention = Dot(axes=-1)([input_1, input_2])
+    w_att_1 = Lambda(lambda x: softmax(x, axis=1),
+                     output_shape=unchanged_shape)(attention)
+    w_att_2 = Permute((2,1))(Lambda(lambda x: softmax(x, axis=2),
+                             output_shape=unchanged_shape)(attention))
+    in1_aligned = Dot(axes=1)([w_att_1, input_1])
+    in2_aligned = Dot(axes=1)([w_att_2, input_2])
+    return in1_aligned, in2_aligned
 
-    # Declare the model as a computational graph.
-    sent1 = embed(ids1) # Shape: (i, n)
-    sent2 = embed(ids2) # Shape: (j, n)
+def aggregate(x1, x2, num_class, dense_dim=300, dropout_rate=0.2, activation="relu"):
+    avgpool1 = GlobalAvgPool1D()(x1)
+    maxpool1 = GlobalMaxPool1D()(x1)
+    avgpool2 = GlobalAvgPool1D()(x2)
+    maxpool2 = GlobalMaxPool1D()(x2)
+    feat1 = concatenate([avgpool1, maxpool1])
+    feat2 = concatenate([avgpool2, maxpool2])
+    x = Concatenate()([feat1, feat2])
+    x = BatchNormalization()(x)
+    x = Dense(dense_dim, activation=activation)(x)
+    x = Dropout(dropout_rate)(x)
+    x = BatchNormalization()(x)
+    x = Dense(dense_dim, activation=activation)(x)
+    x = Dropout(dropout_rate)(x)
+    scores = Dense(num_class, activation='sigmoid')(x)
+    return scores    
 
-    if settings['gru_encode']:
-        sent1 = encode(sent1)
-        sent2 = encode(sent2)
-
-    attention = attend(sent1, sent2)  # Shape: (i, j)
-
-    align1 = align(sent2, attention)
-    align2 = align(sent1, attention, transpose=True)
-
-    feats1 = compare(sent1, align1)
-    feats2 = compare(sent2, align2)
-
-    scores = entail(feats1, feats2)
-
-    # Now that we have the input/output, we can construct the Model object...
-    model = Model(input=[ids1, ids2], output=[scores])
-
-    # ...Compile it...
-    model.compile(
-        optimizer=Adam(lr=settings['lr']),
-        loss='categorical_crossentropy',
-        metrics=['accuracy'])
-    # ...And return it for training.
+def build_model(embedding_matrix, num_class=1, 
+                           projection_dim=300, projection_hidden=0, projection_dropout=0.2,
+                           compare_dim=500, compare_dropout=0.2,
+                           dense_dim=300, dropout_rate=0.2,
+                           lr=1e-3, activation='relu', maxlen=30, trainable=False):
+    q1 = Input(name='q1',shape=(maxlen,))
+    q2 = Input(name='q2',shape=(maxlen,))
+    
+    # Embedding
+    encode = StaticEmbedding(embedding_matrix, trainable=trainable)
+    q1_embed = encode(q1)
+    q2_embed = encode(q2)
+    
+    # Projection
+    projection_layers = []
+    if projection_hidden > 0:
+        projection_layers.extend([
+                Dense(projection_hidden, activation=activation),
+                Dropout(rate=projection_dropout),
+            ])
+    projection_layers.extend([
+            Dense(projection_dim, activation=None),
+            Dropout(rate=projection_dropout),
+        ])
+    q1_encoded = time_distributed(q1_embed, projection_layers)
+    q2_encoded = time_distributed(q2_embed, projection_layers)
+    
+    # Attention
+    q1_aligned, q2_aligned = align(q1_encoded, q2_encoded)    
+    
+    # Compare
+    q1_combined = concatenate([q1_encoded, q2_aligned])
+    q2_combined = concatenate([q2_encoded, q1_aligned]) 
+    compare_layers = [
+        Dense(compare_dim, activation=activation),
+        Dropout(compare_dropout),
+        Dense(compare_dim, activation=activation),
+        Dropout(compare_dropout),
+    ]
+    q1_compare = time_distributed(q1_combined, compare_layers)
+    q2_compare = time_distributed(q2_combined, compare_layers)
+    
+    # Aggregate
+    scores = aggregate(q1_compare, q2_compare, num_class)
+    
+    model = Model(inputs=[q1, q2], outputs=scores)
     return model
-
-
-class _StaticEmbedding(object):
-    def __init__(self, vectors, max_length, nr_out, nr_tune=1000, dropout=0.0):
-        self.nr_out = nr_out
-        self.max_length = max_length
-        self.embed = Embedding(
-                        vectors.shape[0],
-                        vectors.shape[1],
-                        input_length=max_length,
-                        weights=[vectors],
-                        name='embed',
-                        trainable=False)
-        self.tune = Embedding(
-                        nr_tune,
-                        nr_out,
-                        input_length=max_length,
-                        weights=None,
-                        name='tune',
-                        trainable=True,
-                        dropout=dropout)
-        self.mod_ids = Lambda(lambda sent: sent % (nr_tune-1)+1,
-                              output_shape=(self.max_length,))
-
-        self.project = TimeDistributed(
-                            Dense(
-                                nr_out,
-                                activation=None,
-                                bias=False,
-                                name='project'))
-
-    def __call__(self, sentence):
-        def get_output_shape(shapes):
-            print(shapes)
-            return shapes[0]
-        mod_sent = self.mod_ids(sentence)
-        tuning = self.tune(mod_sent)
-        #tuning = merge([tuning, mod_sent],
-        #    mode=lambda AB: AB[0] * (K.clip(K.cast(AB[1], 'float32'), 0, 1)),
-        #    output_shape=(self.max_length, self.nr_out))
-        pretrained = self.project(self.embed(sentence))
-        vectors = merge([pretrained, tuning], mode='sum')
-        return vectors
-
-
-class _BiRNNEncoding(object):
-    def __init__(self, max_length, nr_out, dropout=0.0):
-        self.model = Sequential()
-        self.model.add(Bidirectional(LSTM(nr_out, return_sequences=True,
-                                         dropout_W=dropout, dropout_U=dropout),
-                                         input_shape=(max_length, nr_out)))
-        self.model.add(TimeDistributed(Dense(nr_out, activation='relu', init='he_normal')))
-        self.model.add(TimeDistributed(Dropout(0.2)))
-
-    def __call__(self, sentence):
-        return self.model(sentence)
-
-
-class _Attention(object):
-    def __init__(self, max_length, nr_hidden, dropout=0.0, L2=0.0, activation='relu'):
-        self.max_length = max_length
-        self.model = Sequential()
-        self.model.add(Dropout(dropout, input_shape=(nr_hidden,)))
-        self.model.add(
-            Dense(nr_hidden, name='attend1',
-                init='he_normal', W_regularizer=l2(L2),
-                input_shape=(nr_hidden,), activation='relu'))
-        self.model.add(Dropout(dropout))
-        self.model.add(Dense(nr_hidden, name='attend2',
-            init='he_normal', W_regularizer=l2(L2), activation='relu'))
-        self.model = TimeDistributed(self.model)
-
-    def __call__(self, sent1, sent2):
-        def _outer(AB):
-            att_ji = K.batch_dot(AB[1], K.permute_dimensions(AB[0], (0, 2, 1)))
-            return K.permute_dimensions(att_ji,(0, 2, 1))
-        return merge(
-                [self.model(sent1), self.model(sent2)],
-                mode=_outer,
-                output_shape=(self.max_length, self.max_length))
-
-
-class _SoftAlignment(object):
-    def __init__(self, max_length, nr_hidden):
-        self.max_length = max_length
-        self.nr_hidden = nr_hidden
-
-    def __call__(self, sentence, attention, transpose=False):
-        def _normalize_attention(attmat):
-            att = attmat[0]
-            mat = attmat[1]
-            if transpose:
-                att = K.permute_dimensions(att,(0, 2, 1))
-            # 3d softmax
-            e = K.exp(att - K.max(att, axis=-1, keepdims=True))
-            s = K.sum(e, axis=-1, keepdims=True)
-            sm_att = e / s
-            return K.batch_dot(sm_att, mat)
-        return merge([attention, sentence], mode=_normalize_attention,
-                      output_shape=(self.max_length, self.nr_hidden)) # Shape: (i, n)
-
-
-class _Comparison(object):
-    def __init__(self, words, nr_hidden, L2=0.0, dropout=0.0):
-        self.words = words
-        self.model = Sequential()
-        self.model.add(Dropout(dropout, input_shape=(nr_hidden*2,)))
-        self.model.add(Dense(nr_hidden, name='compare1',
-            init='he_normal', W_regularizer=l2(L2)))
-        self.model.add(Activation('relu'))
-        self.model.add(Dropout(dropout))
-        self.model.add(Dense(nr_hidden, name='compare2',
-                        W_regularizer=l2(L2), init='he_normal'))
-        self.model.add(Activation('relu'))
-        self.model = TimeDistributed(self.model)
-
-    def __call__(self, sent, align, **kwargs):
-        result = self.model(merge([sent, align], mode='concat')) # Shape: (i, n)
-        avged = GlobalAveragePooling1D()(result, mask=self.words)
-        maxed = GlobalMaxPooling1D()(result, mask=self.words)
-        merged = merge([avged, maxed])
-        result = BatchNormalization()(merged)
-        return result
-
-
-class _Entailment(object):
-    def __init__(self, nr_hidden, nr_out, dropout=0.0, L2=0.0):
-        self.model = Sequential()
-        self.model.add(Dropout(dropout, input_shape=(nr_hidden*2,)))
-        self.model.add(Dense(nr_hidden, name='entail1',
-            init='he_normal', W_regularizer=l2(L2)))
-        self.model.add(Activation('relu'))
-        self.model.add(Dropout(dropout))
-        self.model.add(Dense(nr_hidden, name='entail2',
-            init='he_normal', W_regularizer=l2(L2)))
-        self.model.add(Activation('relu'))
-        self.model.add(Dense(nr_out, name='entail_out', activation='softmax',
-                        W_regularizer=l2(L2), init='zero'))
-
-    def __call__(self, feats1, feats2):
-        features = merge([feats1, feats2], mode='concat')
-        return self.model(features)
-
-
-class _GlobalSumPooling1D(Layer):
-    '''Global sum pooling operation for temporal data.
-    # Input shape
-        3D tensor with shape: `(samples, steps, features)`.
-    # Output shape
-        2D tensor with shape: `(samples, features)`.
-    '''
-    def __init__(self, **kwargs):
-        super(_GlobalSumPooling1D, self).__init__(**kwargs)
-        self.input_spec = [InputSpec(ndim=3)]
-
-    def get_output_shape_for(self, input_shape):
-        return (input_shape[0], input_shape[2])
-
-    def call(self, x, mask=None):
-        if mask is not None:
-            return K.sum(x * K.clip(mask, 0, 1), axis=1)
-        else:
-            return K.sum(x, axis=1)
-
-
-def test_build_model():
-    vectors = numpy.ndarray((100, 8), dtype='float32')
-    shape = (10, 16, 3)
-    settings = {'lr': 0.001, 'dropout': 0.2, 'gru_encode':True}
-    model = build_model(vectors, shape, settings)
