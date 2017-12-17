@@ -1,3 +1,7 @@
+"""
+Adapted from the code produced by: https://github.com/explosion/spaCy/tree/master/examples/keras_parikh_entailment
+"""
+
 from keras.layers import *
 from keras.activations import softmax
 from keras.models import Model
