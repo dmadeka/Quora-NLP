@@ -3,6 +3,16 @@ from keras.activations import softmax
 from keras.models import Model
 
 def StaticEmbedding(embedding_matrix, trainable=False):
+    """
+    Static Embedding with the option to train
+    
+    Parameters
+    ----------
+    embedding_matrix: ndarray
+        Embedding Matrix for the Model
+    trainable: boolean
+        Whether the embedding matrix should be trainable
+    """
     in_dim, out_dim = embedding_matrix.shape
     embedding = Embedding(in_dim, out_dim, weights=[embedding_matrix], trainable=trainable)
     return embedding
@@ -46,7 +56,7 @@ def build_model(embedding_matrix, num_class=1,
                            projection_dim=300, projection_hidden=0, projection_dropout=0.2,
                            compare_dim=500, compare_dropout=0.2,
                            dense_dim=300, dropout_rate=0.2,
-                           lr=1e-3, activation='relu', maxlen=30, trainable=False):
+                           lr=1e-3, activation='relu', maxlen=30, trainable=False, compare_layers=None):
     q1 = Input(name='q1',shape=(maxlen,))
     q2 = Input(name='q2',shape=(maxlen,))
     
@@ -74,13 +84,14 @@ def build_model(embedding_matrix, num_class=1,
     
     # Compare
     q1_combined = concatenate([q1_encoded, q2_aligned])
-    q2_combined = concatenate([q2_encoded, q1_aligned]) 
-    compare_layers = [
-        Dense(compare_dim, activation=activation),
-        Dropout(compare_dropout),
-        Dense(compare_dim, activation=activation),
-        Dropout(compare_dropout),
-    ]
+    q2_combined = concatenate([q2_encoded, q1_aligned])
+    if compare_layers is None:
+        compare_layers = [
+            Dense(compare_dim, activation=activation),
+            Dropout(compare_dropout),
+            Dense(compare_dim, activation=activation),
+            Dropout(compare_dropout),
+        ]
     q1_compare = time_distributed(q1_combined, compare_layers)
     q2_compare = time_distributed(q2_combined, compare_layers)
     
