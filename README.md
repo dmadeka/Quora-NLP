@@ -40,3 +40,13 @@ The notebooks contains the primary implementation of each model:
 - Decomposable Attention - Standard.ipynb - Contains the decomposable attention model proposed by [Parikh et. al (2016)](https://arxiv.org/pdf/1606.01933.pdf)
 - Decomposable Attention - Trainable Embeddings.ipynb - Contains the decomposable attention model proposed by [Parikh et. al (2016)](https://arxiv.org/pdf/1606.01933.pdf) with trainable embeddings
 - Parameter Counter.ipynb - Notebook for counting the number of parameters in different models
+
+### Images
+
+- attn1.png - Demonstration of how the [Parikh et. al (2016)](https://arxiv.org/pdf/1606.01933.pdf) model is able to identify the token which creates a semantic difference between the two passages
+
+![](images/attn1.png?raw=true)
+
+- hist-sim-grams.png - Histograms for dis-similar (red) and similar (green) similar n-gram counts
+
+![](images/hist-sim-grams.png?raw=true)
